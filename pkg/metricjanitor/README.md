@@ -45,36 +45,83 @@ cardinality API (inventory) ─────┘
 | Grace period for newly emitted metrics | `ClassifyOptions.MinAge` / `FirstSeen` | ✅ implemented |
 | Reinstate dropped metrics on renewed use | `Reinstate` | ✅ implemented |
 | Generate drop rules + runtime-config overrides | `GenerateDropConfigs`, `BuildOverrides` | ✅ implemented |
+| Stateless reconcile (state in / state out) | `Reconcile` | ✅ implemented |
+| External state store (survives pod restarts) | `StateStore`, `BucketStateStore` | ✅ implemented |
+| Auto-apply overrides Mimir reloads | `Publisher`, `BucketPublisher` | ✅ implemented |
 | Pull dashboard/rule usage from Grafana/Ruler | `pkg/mimirtool/analyze` (reuse) | ↩ available upstream |
 | Pull inventory from the cardinality API | _controller wiring_ | ⬜ TODO |
-| Persist first-seen + drop-list state across runs | _controller wiring_ | ⬜ TODO |
-| Apply overrides + scheduling loop | _controller wiring_ | ⬜ TODO |
+| Scheduling loop + leader election | _controller wiring_ | ⬜ TODO |
+
+## Statelessness and automated apply
+
+The controller process holds **no durable state of its own**, so its pods can be
+restarted or scaled freely:
+
+- **State lives in object storage.** `Reconcile` is a pure function — it takes the
+  previous `State` and returns the next one. Each cycle the controller does
+  `state := store.Load(ctx)` → `Reconcile(...)` → `store.Save(ctx, state)` using a
+  `BucketStateStore` (the same `objstore.Bucket` backend Mimir uses for blocks).
+  The state remembers per-metric `FirstSeen` (for the grace period) and the
+  drop-list (because a dropped metric leaves the inventory and can only be
+  remembered, not rediscovered). Run the controller as a singleton / leader-elected
+  so two replicas don't interleave read-modify-write on the object.
+
+- **Mimir picks up drop rules automatically.** `-runtime-config.file` accepts a
+  comma-separated list of files/URLs that Mimir **merges left to right** and
+  reloads every `-runtime-config.reload-period` (10s default). Give the controller
+  its own dedicated overrides file, listed **last** so it layers on top without
+  clobbering operator-managed runtime config:
+
+  ```
+  -runtime-config.file=base-runtime.yaml,metricjanitor-overrides.yaml
+  ```
+
+  `BucketPublisher` writes that file each cycle; Mimir reloads it within seconds,
+  no restart required. When nothing is dropped it publishes `overrides: {}` so
+  clearing all drops also propagates.
+
+```
+   load State ──▶ Reconcile(state, inventory, usage) ──▶ save State
+                        │
+                        ├─▶ Publisher.Publish(overrides)  ─▶ Mimir auto-reloads
+                        └─▶ Reports (drops / reinstatements for alerting)
+```
 
 ## Usage sketch
 
+One reconcile cycle, wiring the stateless brain to the external store and the
+auto-reloaded overrides file:
+
 ```go
-usages := make(metricjanitor.Usages)
-
-// 1. Read usage: mine query-frontend logs.
-metricjanitor.MineQueryLog(logReader, usages, time.Now())
-
-// 2. Static usage: feed metrics from `mimirtool analyze grafana/ruler`.
-u := usages.ForTenant("tenant-a")
-for _, m := range dashboardAndRuleMetrics {
-    u.AddReferenced(m)
-}
-
-// 3. Classify the tenant's full inventory (from the cardinality API).
+store := metricjanitor.NewBucketStateStore(bucket, "metricjanitor/state.json")
+publisher := metricjanitor.NewBucketPublisher(bucket, "metricjanitor/overrides.yaml")
 protect, _ := metricjanitor.CompileProtectList([]string{".*:.*"}) // never drop recording rules
-decision := metricjanitor.Classify(inventory, usages.ForTenant("tenant-a"), metricjanitor.ClassifyOptions{
-    UnusedFor: 30 * 24 * time.Hour,
-    Protect:   protect,
-})
 
-// 4. Render drop rules into a runtime-config overrides file.
-out, _ := metricjanitor.BuildOverrides([]metricjanitor.TenantPlan{
-    {Tenant: "tenant-a", Drop: decision.Unused},
-}, metricjanitor.DefaultMaxNamesPerDropConfig)
+// 1. Gather per-tenant usage: read usage from query-frontend logs...
+usages := make(metricjanitor.Usages)
+metricjanitor.MineQueryLog(logReader, usages, time.Now())
+// ...plus dashboard/rule references from `mimirtool analyze grafana/ruler`.
+usages.ForTenant("tenant-a").AddReferenced("up")
+
+// 2. Load state, reconcile against the current inventory (cardinality API), save.
+state, _ := store.Load(ctx)
+res, _ := metricjanitor.Reconcile(state, metricjanitor.ReconcileInput{
+    Inventory: map[string][]string{"tenant-a": inventory},
+    Usage:     usages,
+}, metricjanitor.ReconcileOptions{
+    Classify: metricjanitor.ClassifyOptions{
+        UnusedFor: 30 * 24 * time.Hour,
+        MinAge:    7 * 24 * time.Hour, // grace period for new metrics
+        Protect:   protect,
+    },
+    ForgetUnseenAfter: 30 * 24 * time.Hour,
+}, time.Now())
+_ = store.Save(ctx, state)
+
+// 3. Publish the overrides; Mimir reloads them within reload-period.
+_ = publisher.Publish(ctx, res.Overrides)
+
+// res.Reports carries the per-tenant drop/reinstate deltas for alerting.
 ```
 
 ## Metric lifecycle
@@ -133,12 +180,11 @@ flipping straight to "dropped":
 
 ## Roadmap
 
-1. Controller wiring: cardinality-API client for inventory, `mimirtool analyze`
-   integration for dashboard/rule usage, and an apply step (write runtime
-   config, or open a PR).
-2. State persistence: record per-tenant `FirstSeen` (so the `MinAge` grace
-   period survives restarts) and the current drop-list (so `Reinstate` knows
-   what was dropped, since dropped metrics no longer appear in the inventory).
+1. Controller binary: cardinality-API client for inventory, `mimirtool analyze`
+   integration for dashboard/rule usage, a scheduling loop, and leader election
+   (so a single replica owns the read-modify-write of the state object).
+2. Additional `Publisher`/`StateStore` backends as needed (e.g. a Kubernetes
+   ConfigMap publisher for clusters that mount runtime config from a ConfigMap).
 3. A `--dry-run` reporting mode and a cardinality-weighted savings estimate.
 4. Aggregation (roll-up) rules as a less destructive alternative to dropping,
    matching the second half of Adaptive Metrics.
