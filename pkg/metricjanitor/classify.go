@@ -27,9 +27,22 @@ type ClassifyOptions struct {
 	// incidents, or anything matching `.*:.*` recording-rule outputs). Each
 	// pattern is matched against the full metric name (anchored).
 	Protect []*regexp.Regexp
+
+	// MinAge is a grace period: a metric must have been observed in the tenant's
+	// inventory for at least this long before it becomes eligible to be dropped.
+	// This prevents dropping a freshly introduced metric that simply has not had
+	// time to appear in dashboards, rules or queries yet. When MinAge is zero the
+	// grace period is disabled and FirstSeen is ignored.
+	MinAge time.Duration
+
+	// FirstSeen maps a metric name to the first time the controller observed it in
+	// the inventory. It is consulted only when MinAge > 0. A metric whose
+	// FirstSeen is unknown (not in the map) is treated as too new to drop, so the
+	// first runs of a controller with no persisted history drop nothing.
+	FirstSeen map[string]time.Time
 }
 
-// Decision is the result of classifying a tenant's inventory. The three slices
+// Decision is the result of classifying a tenant's inventory. The four slices
 // are disjoint and together cover every metric in the inventory. All are sorted.
 type Decision struct {
 	// Used metrics are referenced by a dashboard/rule or queried recently.
@@ -39,12 +52,17 @@ type Decision struct {
 	// Protected metrics matched the protection allowlist; they are never dropped
 	// and are reported separately so operators can audit what the allowlist saved.
 	Protected []string
+	// New metrics look unused but are younger than MinAge, so they are kept until
+	// they have been observed long enough to judge. Reported separately so the
+	// grace period is visible rather than silently folded into Used.
+	New []string
 }
 
 // Classify partitions inventory (the full set of metric names the tenant is
 // currently ingesting) using the supplied usage evidence and options. A metric
 // is Unused only when it is neither referenced by a dashboard/rule, nor queried
-// within the UnusedFor window, nor matched by the protection allowlist.
+// within the UnusedFor window, nor matched by the protection allowlist, nor
+// younger than MinAge.
 func Classify(inventory []string, usage *Usage, opts ClassifyOptions) Decision {
 	if usage == nil {
 		usage = NewUsage()
@@ -62,6 +80,8 @@ func Classify(inventory []string, usage *Usage, opts ClassifyOptions) Decision {
 			d.Protected = append(d.Protected, metric)
 		case isUsed(metric, usage, cutoff):
 			d.Used = append(d.Used, metric)
+		case opts.tooNewToDrop(metric, now):
+			d.New = append(d.New, metric)
 		default:
 			d.Unused = append(d.Unused, metric)
 		}
@@ -70,7 +90,22 @@ func Classify(inventory []string, usage *Usage, opts ClassifyOptions) Decision {
 	sort.Strings(d.Used)
 	sort.Strings(d.Unused)
 	sort.Strings(d.Protected)
+	sort.Strings(d.New)
 	return d
+}
+
+// tooNewToDrop reports whether metric is still within its drop grace period.
+func (opts ClassifyOptions) tooNewToDrop(metric string, now time.Time) bool {
+	if opts.MinAge <= 0 {
+		return false
+	}
+	first, ok := opts.FirstSeen[metric]
+	if !ok {
+		// Unknown age: be conservative and never drop a metric we have not been
+		// watching long enough to have a first-seen time for.
+		return true
+	}
+	return first.After(now.Add(-opts.MinAge))
 }
 
 // isUsed reports whether metric is referenced statically or was queried at or

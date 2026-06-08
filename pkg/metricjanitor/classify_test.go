@@ -59,6 +59,40 @@ func TestClassify_QueryExactlyAtCutoffIsUsed(t *testing.T) {
 	require.Equal(t, []string{"edge"}, got.Used)
 }
 
+func TestClassify_GracePeriodKeepsNewMetrics(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+
+	inventory := []string{"old_unused", "freshly_added", "age_unknown"}
+	firstSeen := map[string]time.Time{
+		"old_unused":    now.Add(-10 * 24 * time.Hour), // older than MinAge -> droppable
+		"freshly_added": now.Add(-12 * time.Hour),      // younger than MinAge -> kept as New
+		// "age_unknown" intentionally absent -> treated as too new -> kept as New.
+	}
+
+	got := Classify(inventory, NewUsage(), ClassifyOptions{
+		UnusedFor: 30 * 24 * time.Hour,
+		Now:       now,
+		MinAge:    7 * 24 * time.Hour,
+		FirstSeen: firstSeen,
+	})
+
+	require.Equal(t, []string{"old_unused"}, got.Unused)
+	require.Equal(t, []string{"age_unknown", "freshly_added"}, got.New)
+	require.Empty(t, got.Used)
+}
+
+func TestClassify_GracePeriodDisabledByDefault(t *testing.T) {
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+	// With MinAge == 0 the grace period is off, so age and FirstSeen are ignored.
+	got := Classify([]string{"brand_new"}, NewUsage(), ClassifyOptions{
+		UnusedFor: time.Hour,
+		Now:       now,
+		FirstSeen: map[string]time.Time{"brand_new": now},
+	})
+	require.Equal(t, []string{"brand_new"}, got.Unused)
+	require.Empty(t, got.New)
+}
+
 func TestCompileProtectList_AnchorsPatterns(t *testing.T) {
 	protect, err := CompileProtectList([]string{"up"})
 	require.NoError(t, err)
